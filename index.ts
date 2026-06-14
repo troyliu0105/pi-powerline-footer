@@ -28,7 +28,16 @@ import { getPreset, PRESETS } from "./presets.ts";
 import { collectHiddenExtensionStatusKeys, getNotificationExtensionStatuses, mergeSegmentOptions, mergeSegmentsWithCustomItems, nextPowerlineSettingWithOptions, nextPowerlineSettingWithPreset, parsePowerlineConfig } from "./powerline-config.ts";
 import { getSeparator } from "./separators.ts";
 import { renderSegment } from "./segments.ts";
-import { getGitStatus, invalidateGitStatus, invalidateGitBranch } from "./git-status.ts";
+import {
+  getGitStatus,
+  invalidateGitStatus,
+  invalidateGitBranch,
+  refreshGitStatus,
+  startGitStatusPoller,
+  stopGitStatusPoller,
+  setGitStatusChangeListener,
+  configureGitStatusCwd,
+} from "./git-status.ts";
 import { ansi, getFgAnsiCode } from "./colors.ts";
 import { WelcomeComponent, WelcomeHeader, discoverLoadedCounts, getRecentSessions } from "./welcome.ts";
 import { createWelcomeDismissScheduler } from "./welcome-dismiss.ts";
@@ -603,7 +612,7 @@ function writePowerlineSetting(cwd: string, update: (existingPowerlineSetting: u
     return false;
   }
 
-  const writeToProject = Object.prototype.hasOwnProperty.call(projectSettings, "powerline");
+  const writeToProject = Object.hasOwn(projectSettings, "powerline");
   const settingsPath = writeToProject ? projectSettingsPath : globalSettingsPath;
   const settings = writeToProject ? projectSettings : globalSettings;
 
@@ -638,7 +647,7 @@ function writePowerlineOptionSetting(
 const PRESET_NAMES = Object.keys(PRESETS) as StatusLinePreset[];
 
 function isValidPreset(value: unknown): value is StatusLinePreset {
-  return typeof value === "string" && Object.prototype.hasOwnProperty.call(PRESETS, value);
+  return typeof value === "string" && Object.hasOwn(PRESETS, value);
 }
 
 function normalizePreset(value: unknown): StatusLinePreset | null {
@@ -913,8 +922,8 @@ function computeResponsiveLayout(
   // Account for: leading space (1) + trailing space (1) = 2 chars overhead
   const baseOverhead = 2;
   let currentWidth = baseOverhead;
-  let topSegments: string[] = [];
-  let overflowSegments: { content: string; width: number }[] = [];
+  const topSegments: string[] = [];
+  const overflowSegments: { content: string; width: number }[] = [];
   let overflow = false;
   
   for (const seg of renderedSegments) {
@@ -932,7 +941,7 @@ function computeResponsiveLayout(
   // Fit overflow segments into secondary row (same width constraint)
   // Stop at first non-fitting segment to preserve ordering
   let secondaryWidth = baseOverhead;
-  let secondarySegments: string[] = [];
+  const secondarySegments: string[] = [];
   
   for (const seg of overflowSegments) {
     const neededWidth = seg.width + (secondarySegments.length > 0 ? sepWidth : 0);
@@ -995,6 +1004,10 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   let lastLayoutResult: { topContent: string; secondaryContent: string } | null = null;
   let lastLayoutTimestamp = 0;
   let layoutDirty = true;
+  let footerStateVersion = 0;
+  const bumpFooterStateVersion = () => {
+    footerStateVersion += 1;
+  };
   let forceNextLayoutRecompute = false;
   let lastEditorInputAt = 0;
 
@@ -1019,15 +1032,18 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   const resetLayoutCache = () => {
     lastLayoutResult = null;
     layoutDirty = true;
+    bumpFooterStateVersion();
   };
 
   const requestStatusRender = (delayMs?: number) => {
     layoutDirty = true;
+    bumpFooterStateVersion();
     statusRenderScheduler.schedule(delayMs);
   };
 
   const requestImmediateStatusRender = (options: { deferDuringTyping?: boolean } = {}) => {
     layoutDirty = true;
+    bumpFooterStateVersion();
     if (options.deferDuringTyping !== false && Date.now() - lastEditorInputAt < EDITOR_STATUS_DEFER_MS) {
       statusRenderScheduler.schedule();
       return;
@@ -1036,6 +1052,24 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     forceNextLayoutRecompute = true;
     statusRenderScheduler.cancel();
     statusRenderScheduler.schedule(0);
+  };
+
+  const resolveGitPollingMode = (): "full" | "branch" | "off" => {
+    const mode = config?.segmentOptions?.git?.polling;
+    return mode === "off" || mode === "branch" || mode === "full" ? mode : "full";
+  };
+
+  const startFooterGitPoller = (cwd: string) => {
+    configureGitStatusCwd(cwd);
+    setGitStatusChangeListener(() => {
+      bumpFooterStateVersion();
+      requestStatusRender();
+    });
+    startGitStatusPoller({
+      cwd: () => currentCtx?.cwd ?? cwd,
+      pollingMode: resolveGitPollingMode,
+      intervalMs: 2000,
+    });
   };
 
   const installFooterStatusRepaintHook = (footerData: ReadonlyFooterDataProvider) => {
@@ -1224,6 +1258,7 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     resolvedShortcuts = resolveShortcutConfig(settings);
     showLastPrompt = settings.showLastPrompt !== false;
     config = parsePowerlineConfig(settings.powerline, PRESET_NAMES);
+    startFooterGitPoller(ctx.cwd);
     stashedPromptHistory = readPersistedStashHistory();
     bashModeActive = false;
     bashTranscript = new BashTranscriptStore(bashModeSettings);
@@ -1279,6 +1314,8 @@ export default function powerlineFooter(pi: ExtensionAPI) {
     shellSession = null;
     bashModeActive = false;
     currentCtx = null;
+    stopGitStatusPoller();
+    setGitStatusChangeListener(null);
     footerDataRef = null;
     getThinkingLevelFn = null;
     currentThinkingLevel = null;
@@ -1298,18 +1335,25 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   };
 
   // Invalidate git status on file changes, trigger re-render on potential branch changes
+  const refreshGitAfterMutation = () => {
+    invalidateGitStatus();
+    invalidateGitBranch();
+    bumpFooterStateVersion();
+    void refreshGitStatus({ cwd: currentCtx?.cwd, pollingMode: resolveGitPollingMode() });
+  };
+
   pi.on("tool_result", async (event) => {
     if (event.toolName === "write" || event.toolName === "edit") {
       invalidateGitStatus();
+      bumpFooterStateVersion();
+      void refreshGitStatus({ cwd: currentCtx?.cwd, pollingMode: resolveGitPollingMode() });
+      requestStatusRender();
     }
     // Check for bash commands that might change git branch
     if (event.toolName === "bash" && event.input?.command) {
       const cmd = String(event.input.command);
       if (mightChangeGitBranch(cmd)) {
-        // Invalidate caches since working tree state changes with branch
-        invalidateGitStatus();
-        invalidateGitBranch();
-        // Small delay to let git update, then re-render
+        refreshGitAfterMutation();
         setTimeout(() => requestStatusRender(), 100);
       }
     }
@@ -1320,13 +1364,10 @@ export default function powerlineFooter(pi: ExtensionAPI) {
   // to ensure we catch the update after the command completes.
   pi.on("user_bash", async (event) => {
     if (mightChangeGitBranch(event.command)) {
-      // Invalidate immediately so next render fetches fresh data
-      invalidateGitStatus();
-      invalidateGitBranch();
-      // Multiple staggered re-renders to catch fast and slow commands
-      setTimeout(() => requestStatusRender(), 100);
-      setTimeout(() => requestStatusRender(), 300);
-      setTimeout(() => requestStatusRender(), 500);
+      refreshGitAfterMutation();
+      setTimeout(() => { void refreshGitStatus({ cwd: currentCtx?.cwd, pollingMode: resolveGitPollingMode() }); }, 100);
+      setTimeout(() => { void refreshGitStatus({ cwd: currentCtx?.cwd, pollingMode: resolveGitPollingMode() }); }, 300);
+      setTimeout(() => { void refreshGitStatus({ cwd: currentCtx?.cwd, pollingMode: resolveGitPollingMode() }); }, 500);
     }
   });
 

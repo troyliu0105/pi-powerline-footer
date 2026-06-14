@@ -366,6 +366,13 @@ export class TerminalSplitCompositor {
   private lastLeftPress: { area: SelectionArea; line: number; at: number } | null = null;
   private pendingImageCleanup = false;
 
+  // PERF: the high-frequency terminal.rows getter (getScrollableRows) is read
+  // many times per frame by pi-tui. Previously every read outside a render
+  // pass triggered a full renderCluster (status + powerline + editor + git
+  // scan). This dimension-keyed height cache serves an O(1) cluster line count
+  // instead, refreshed whenever a render pass recomputes the cluster.
+  private clusterHeightCache: { width: number; terminalRows: number; lineCount: number } | null = null;
+
   constructor(options: TerminalSplitCompositorOptions) {
     this.tui = options.tui;
     this.terminal = options.terminal;
@@ -576,6 +583,10 @@ export class TerminalSplitCompositor {
 
     const rawRows = this.getRawRows();
     const width = Math.max(1, this.terminal.columns || 80);
+    const cached = this.clusterHeightCache;
+    if (cached && cached.width === width && cached.terminalRows === rawRows) {
+      return Math.max(1, rawRows - cached.lineCount);
+    }
     const cluster = this.getCluster(width, rawRows);
     return Math.max(1, rawRows - cluster.lines.length);
   }
@@ -1071,6 +1082,7 @@ export class TerminalSplitCompositor {
       this.renderPassCluster?.width === width &&
       this.renderPassCluster.terminalRows === terminalRows
     ) {
+      this.clusterHeightCache = { width, terminalRows, lineCount: this.renderPassCluster.cluster.lines.length };
       return this.renderPassCluster.cluster;
     }
 
@@ -1079,6 +1091,7 @@ export class TerminalSplitCompositor {
     if (this.renderPassActive) {
       this.renderPassCluster = { width, terminalRows, cluster };
     }
+    this.clusterHeightCache = { width, terminalRows, lineCount: cluster.lines.length };
     return cluster;
   }
 

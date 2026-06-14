@@ -2,6 +2,18 @@
 
 ## [Unreleased]
 
+### Performance
+- **Eliminated render-path git subprocesses** — The synchronous TUI render path (`render`, `renderPowerlineTopLines`, `getResponsiveLayout`, `buildSegmentContext`) now reads git state from a pure cache only. Branch is read directly from `.git/HEAD` (no subprocess); dirty status is refreshed by an async worker with a one-in-flight guard and TTLs (branch 5s, dirty 2s). This was the primary cause of `pi-powerline-footer` dominating CPU profiles (~65%).
+- **Decoupled `terminal.rows` from full cluster rendering** — The high-frequency `terminal.rows` getter (read many times per frame by pi-tui) no longer triggers a full `renderCluster` (status + powerline + editor + git scan). A dimension-keyed height cache makes it O(1).
+- **Scroll no longer re-renders the entire chat history** — Mouse wheel / keyboard scroll / selection drag now reuse the cached root window and re-slice the viewport instead of calling `originalRender` on every scroll tick.
+- **Footer layout caching** — `getResponsiveLayout` now caches on a full state signature (terminal width + footer state version + theme), so unchanged footer state skips `buildSegmentContext` (session-event scan + git read) entirely on every repaint.
+- **Instrumentation** — Added `PI_POWERLINE_FOOTER_PROFILE=1` env-guarded logging for slow operations (>10ms) and accidental render-path spawn attempts.
+
+### Added
+- `scripts/benchmark-render.ts` — local benchmark that renders the footer read path N times and verifies zero git spawns and sub-microsecond reads.
+
+## [0.6.1] - 2026-06-08
+
 ## [0.6.1] - 2026-06-08
 
 ### Fixed
